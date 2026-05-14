@@ -13,9 +13,13 @@ import struct
 import sys
 import os
 import zlib
+import base64
+import csv
+import hashlib
+import json
 from enum import IntEnum
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, BinaryIO
+from dataclasses import dataclass, field
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, BinaryIO
 
 # DataVault signatures (little-endian)
 ESIFDV_SIGNATURE = 0x1FE5  # Standard DV signature
@@ -690,6 +694,690 @@ class DataVaultParser:
                     'value': val_str
                 })
             print(json.dumps(output, indent=2))
+
+# ---------------------------------------------------------------------------
+# Parser implementation based on Intel DPTF DataVaultHeaderV2 and
+# esif_data_variant.  These definitions intentionally replace the older
+# speculative parser above while keeping the public DataVaultParser name.
+
+ESIFDV_HEADER_V2_MIN_SIZE = 148
+ESIFDV_ITEM_KEYS_REV0_SIGNATURE = 0xA0D8
+SEGMENT_ID_LEN = 32
+COMMENT_LEN = 64
+MAX_U32 = 0xFFFFFFFF
+MAX_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+class PayloadClass(IntEnum):
+    KEYS = 0x5359454B
+    REPO = 0x4F504552
+
+
+class EsifDataType(IntEnum):
+    UINT8 = 1
+    UINT16 = 2
+    UINT32 = 3
+    UINT64 = 4
+    GUID = 5
+    TEMPERATURE = 6
+    BINARY = 7
+    STRING = 8
+    UNICODE = 9
+    INT8 = 11
+    INT16 = 12
+    INT32 = 13
+    INT64 = 14
+    POINTER = 18
+    ENUM = 19
+    HANDLE = 20
+    VOID = 24
+    POWER = 26
+    PERCENT = 29
+    INSTANCE = 30
+    TIME = 31
+    STRUCTURE = 32
+    DSP = 33
+    BLOB = 34
+    TABLE = 35
+    AUTO = 36
+    XML = 38
+    DECIBEL = 39
+    FREQUENCY = 40
+    ANGLE = 41
+    JSON = 42
+
+
+INTEGER_VARIANT_TYPES = {
+    EsifDataType.UINT8,
+    EsifDataType.UINT16,
+    EsifDataType.UINT32,
+    EsifDataType.UINT64,
+    EsifDataType.INT8,
+    EsifDataType.INT16,
+    EsifDataType.INT32,
+    EsifDataType.INT64,
+    EsifDataType.TEMPERATURE,
+    EsifDataType.POWER,
+    EsifDataType.PERCENT,
+    EsifDataType.INSTANCE,
+    EsifDataType.TIME,
+    EsifDataType.ENUM,
+    EsifDataType.DECIBEL,
+    EsifDataType.FREQUENCY,
+    EsifDataType.ANGLE,
+    EsifDataType.HANDLE,
+    EsifDataType.POINTER,
+    EsifDataType.VOID,
+}
+
+BUFFER_VARIANT_TYPES = {
+    EsifDataType.GUID,
+    EsifDataType.BINARY,
+    EsifDataType.STRING,
+    EsifDataType.UNICODE,
+    EsifDataType.STRUCTURE,
+    EsifDataType.DSP,
+    EsifDataType.BLOB,
+    EsifDataType.TABLE,
+    EsifDataType.XML,
+    EsifDataType.JSON,
+}
+
+PSVT_FIELDS = [
+    "Source",
+    "Target",
+    "Priority",
+    "SamplePeriod(ms)",
+    "PassiveTemp(dK)",
+    "SourceDomain",
+    "ControlKnob",
+    "Limit",
+    "StepSize",
+    "LimitCoeff",
+    "UnlimitCoeff",
+    "ControlKnobType",
+]
+
+PPCC_FIELDS_PER_ROW = [
+    "PLIndex",
+    "MinPower(mW)",
+    "MaxPower(mW)",
+    "MinTimeWindow(ms)",
+    "MaxTimeWindow(ms)",
+    "StepSize(mW)",
+]
+
+
+def type_name(type_id: int) -> str:
+    try:
+        return EsifDataType(type_id).name
+    except ValueError:
+        return f"UNKNOWN({type_id})"
+
+
+def payload_class_name(class_id: int) -> str:
+    try:
+        return PayloadClass(class_id).name
+    except ValueError:
+        return f"UNKNOWN(0x{class_id:08x})"
+
+
+def decode_c_string(raw: bytes) -> str:
+    return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def encode_fixed_c_string(value: str, size: int) -> bytes:
+    raw = value.encode("utf-8")
+    if len(raw) >= size:
+        return raw[: size - 1] + b"\x00"
+    return raw + b"\x00" * (size - len(raw))
+
+
+def format_guid(raw: bytes) -> str:
+    if len(raw) < 16:
+        return raw.hex()
+    d = raw[:16]
+    return (
+        f"{d[3]:02x}{d[2]:02x}{d[1]:02x}{d[0]:02x}-"
+        f"{d[5]:02x}{d[4]:02x}-"
+        f"{d[7]:02x}{d[6]:02x}-"
+        f"{d[8]:02x}{d[9]:02x}-"
+        f"{d[10]:02x}{d[11]:02x}{d[12]:02x}{d[13]:02x}{d[14]:02x}{d[15]:02x}"
+    )
+
+
+def dkelvin_to_celsius(value: int) -> float:
+    return value / 10.0 - 273.15
+
+
+@dataclass
+class EsifVariant:
+    type_id: int
+    value: Any
+    offset: int = 0
+    size: int = 0
+    reserved: int = 0
+
+    @property
+    def type_str(self) -> str:
+        return type_name(self.type_id)
+
+    @property
+    def is_buffer(self) -> bool:
+        try:
+            return EsifDataType(self.type_id) in BUFFER_VARIANT_TYPES
+        except ValueError:
+            return False
+
+    @property
+    def is_integer(self) -> bool:
+        try:
+            return EsifDataType(self.type_id) in INTEGER_VARIANT_TYPES
+        except ValueError:
+            return False
+
+    def as_text(self) -> str:
+        if self.type_id == EsifDataType.STRING:
+            return self.value.rstrip(b"\x00").decode("utf-8", errors="replace")
+        if self.type_id == EsifDataType.UNICODE:
+            return self.value.rstrip(b"\x00").decode("utf-16-le", errors="replace")
+        if self.type_id == EsifDataType.GUID:
+            return format_guid(self.value)
+        if self.type_id == EsifDataType.BINARY and isinstance(self.value, bytes) and len(self.value) == 16:
+            return format_guid(self.value)
+        if self.is_integer:
+            if self.value in (MAX_U32, MAX_U64):
+                return "MAX"
+            return str(self.value)
+        if isinstance(self.value, bytes):
+            return "0x" + self.value.hex()
+        return str(self.value)
+
+    def display(self, field_name: Optional[str] = None) -> str:
+        text = self.as_text()
+        if (
+            field_name
+            and "Temp" in field_name
+            and self.is_integer
+            and self.value not in (MAX_U32, MAX_U64)
+        ):
+            text += f" ({dkelvin_to_celsius(self.value):.2f} C)"
+        return text
+
+    def encode(self) -> bytes:
+        if self.is_buffer:
+            return struct.pack("<III", self.type_id, len(self.value), self.reserved) + self.value
+        if not self.is_integer:
+            raise ValueError(f"cannot encode unknown variant type {self.type_id}")
+        return struct.pack("<IQ", self.type_id, self.value & MAX_U64)
+
+    def copy_with_value(self, value: Any) -> "EsifVariant":
+        return EsifVariant(self.type_id, value, self.offset, self.size, self.reserved)
+
+
+@dataclass
+class DecodedTable:
+    kind: str
+    revision: EsifVariant
+    rows: List[List[EsifVariant]]
+    field_names: List[str]
+    trailing: List[EsifVariant] = field(default_factory=list)
+
+    def encode(self) -> bytes:
+        out = bytearray(self.revision.encode())
+        for row in self.rows:
+            for variant in row:
+                out.extend(variant.encode())
+        for variant in self.trailing:
+            out.extend(variant.encode())
+        return bytes(out)
+
+    def field_index(self, name: str) -> int:
+        normal = name.lower()
+        for idx, field_name in enumerate(self.field_names):
+            if field_name.lower() == normal:
+                return idx
+        raise KeyError(name)
+
+
+@dataclass
+class KeyValueEntry:
+    key: str
+    data_type: int
+    flags: int
+    data: bytes
+    marker: int = ESIFDV_ITEM_KEYS_REV0_SIGNATURE
+
+    @property
+    def type_str(self) -> str:
+        return type_name(self.data_type)
+
+    def encode(self) -> bytes:
+        key_bytes = self.key.encode("utf-8") + b"\x00"
+        return b"".join(
+            [
+                struct.pack("<HII", self.marker, self.flags, len(key_bytes)),
+                key_bytes,
+                struct.pack("<II", self.data_type, len(self.data)),
+                self.data,
+            ]
+        )
+
+    def decode_table(self) -> Optional[DecodedTable]:
+        key = self.key.lower()
+        if "/psvt" in key:
+            return decode_variant_table(self.data, "psvt", PSVT_FIELDS)
+        if "/ppcc" in key:
+            return decode_variant_table(self.data, "ppcc", PPCC_FIELDS_PER_ROW)
+        return None
+
+    def decode_variants(self) -> Optional[List[EsifVariant]]:
+        try:
+            variants, end = parse_variant_stream(self.data)
+        except ValueError:
+            return None
+        if end != len(self.data):
+            return None
+        return variants
+
+    def decoded_value(self) -> Any:
+        table = self.decode_table()
+        if table is not None:
+            return table
+        variants = self.decode_variants()
+        if variants:
+            if len(variants) == 1:
+                return variants[0]
+            return variants
+        if self.data_type == EsifDataType.STRING:
+            return self.data.rstrip(b"\x00").decode("utf-8", errors="replace")
+        if self.data_type == EsifDataType.GUID and len(self.data) >= 16:
+            return format_guid(self.data)
+        if self.data_type in (EsifDataType.XML, EsifDataType.JSON):
+            return self.data.rstrip(b"\x00").decode("utf-8", errors="replace")
+        if self.data_type == EsifDataType.UINT64 and len(self.data) >= 8:
+            return struct.unpack_from("<Q", self.data)[0]
+        if self.data_type == EsifDataType.UINT32 and len(self.data) >= 4:
+            return struct.unpack_from("<I", self.data)[0]
+        return self.data
+
+
+@dataclass
+class DataVaultSegment:
+    signature: int
+    header_size: int
+    version: int
+    flags: int
+    segment_id: str
+    comment: str
+    payload_hash: bytes
+    payload_size: int
+    payload_class: int
+    entries: List[KeyValueEntry] = field(default_factory=list)
+    raw_payload: bytes = b""
+    offset: int = 0
+    header_extra: bytes = b""
+
+    @property
+    def major_version(self) -> int:
+        return (self.version >> 24) & 0xFF
+
+    @property
+    def minor_version(self) -> int:
+        return (self.version >> 16) & 0xFF
+
+    @property
+    def revision(self) -> int:
+        return self.version & 0xFFFF
+
+    @property
+    def hash_valid(self) -> bool:
+        return hashlib.sha256(self.raw_payload).digest() == self.payload_hash
+
+    def build_payload(self) -> bytes:
+        if self.payload_class == PayloadClass.KEYS:
+            return b"".join(entry.encode() for entry in self.entries)
+        return self.raw_payload
+
+    def encode(self) -> bytes:
+        payload = self.build_payload()
+        payload_hash = hashlib.sha256(payload).digest()
+        header = b"".join(
+            [
+                struct.pack("<HHII", self.signature, self.header_size, self.version, self.flags),
+                encode_fixed_c_string(self.segment_id, SEGMENT_ID_LEN),
+                encode_fixed_c_string(self.comment, COMMENT_LEN),
+                payload_hash,
+                struct.pack("<II", len(payload), self.payload_class),
+            ]
+        )
+        if len(header) > self.header_size:
+            raise ValueError(f"header is larger than header_size ({len(header)} > {self.header_size})")
+        if len(header) < self.header_size:
+            extra = self.header_extra[: self.header_size - len(header)]
+            header += extra
+            header += b"\x00" * (self.header_size - len(header))
+        return header + payload
+
+
+def parse_variant(data: bytes, offset: int) -> Tuple[EsifVariant, int]:
+    if offset + 12 > len(data):
+        raise ValueError(f"truncated esif_data_variant at offset {offset}")
+
+    type_id = struct.unpack_from("<I", data, offset)[0]
+    try:
+        data_type = EsifDataType(type_id)
+    except ValueError as exc:
+        raise ValueError(f"unknown esif_data_variant type {type_id} at offset {offset}") from exc
+
+    if data_type in BUFFER_VARIANT_TYPES:
+        length, reserved = struct.unpack_from("<II", data, offset + 4)
+        end = offset + 12 + length
+        if end > len(data):
+            raise ValueError(f"truncated buffer variant at offset {offset}")
+        return EsifVariant(type_id, data[offset + 12 : end], offset, end - offset, reserved), end
+
+    if data_type not in INTEGER_VARIANT_TYPES:
+        raise ValueError(f"unsupported esif_data_variant type {type_id} at offset {offset}")
+
+    value = struct.unpack_from("<Q", data, offset + 4)[0]
+    return EsifVariant(type_id, value, offset, 12, 0), offset + 12
+
+
+def parse_variant_stream(data: bytes, offset: int = 0) -> Tuple[List[EsifVariant], int]:
+    variants: List[EsifVariant] = []
+    pos = offset
+    while pos < len(data):
+        variant, pos = parse_variant(data, pos)
+        variants.append(variant)
+    return variants, pos
+
+
+def decode_variant_table(data: bytes, kind: str, field_names: Sequence[str]) -> Optional[DecodedTable]:
+    try:
+        variants, end = parse_variant_stream(data)
+    except ValueError:
+        return None
+    if end != len(data) or not variants:
+        return None
+
+    width = len(field_names)
+    revision = variants[0]
+    fields = variants[1:]
+    rows = [fields[i : i + width] for i in range(0, len(fields) - (len(fields) % width), width)]
+    trailing = fields[len(rows) * width :]
+    return DecodedTable(kind, revision, rows, list(field_names), trailing)
+
+
+class DataVaultParser:
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.segments: List[DataVaultSegment] = []
+        self.entries: List[KeyValueEntry] = []
+
+    def log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[DEBUG] {message}", file=sys.stderr)
+
+    def parse_file(self, filepath: str) -> bool:
+        with open(filepath, "rb") as f:
+            return self.parse_bytes(f.read())
+
+    def parse_bytes(self, data: bytes) -> bool:
+        self.segments = []
+        self.entries = []
+        pos = 0
+
+        while pos < len(data):
+            if pos + ESIFDV_HEADER_V2_MIN_SIZE > len(data):
+                raise ValueError(f"trailing {len(data) - pos} bytes after last DataVault segment")
+
+            signature = struct.unpack_from("<H", data, pos)[0]
+            if signature != ESIFDV_SIGNATURE:
+                raise ValueError(f"invalid DataVault signature 0x{signature:04x} at offset {pos}")
+
+            header_size, version, flags = struct.unpack_from("<HII", data, pos + 2)
+            if header_size < ESIFDV_HEADER_V2_MIN_SIZE:
+                raise ValueError(f"invalid DataVault header size {header_size} at offset {pos}")
+
+            header_end = pos + header_size
+            if header_end > len(data):
+                raise ValueError(f"truncated DataVault header at offset {pos}")
+
+            segment_id = decode_c_string(data[pos + 12 : pos + 44])
+            comment = decode_c_string(data[pos + 44 : pos + 108])
+            payload_hash = data[pos + 108 : pos + 140]
+            payload_size, payload_class = struct.unpack_from("<II", data, pos + 140)
+            payload_start = header_end
+            payload_end = payload_start + payload_size
+            if payload_end > len(data):
+                raise ValueError(f"truncated DataVault payload at offset {payload_start}")
+
+            payload = data[payload_start:payload_end]
+            entries: List[KeyValueEntry] = []
+            if payload_class == PayloadClass.KEYS:
+                entries = self.parse_keys_payload(payload)
+                self.entries.extend(entries)
+            else:
+                self.log(f"skipping non-KEYS payload class {payload_class_name(payload_class)}")
+
+            segment = DataVaultSegment(
+                signature=signature,
+                header_size=header_size,
+                version=version,
+                flags=flags,
+                segment_id=segment_id,
+                comment=comment,
+                payload_hash=payload_hash,
+                payload_size=payload_size,
+                payload_class=payload_class,
+                entries=entries,
+                raw_payload=payload,
+                offset=pos,
+                header_extra=data[pos + ESIFDV_HEADER_V2_MIN_SIZE : header_end],
+            )
+            if not segment.hash_valid:
+                self.log(f"payload hash mismatch for segment {segment_id!r}")
+            self.segments.append(segment)
+            pos = payload_end
+        return True
+
+    def parse_keys_payload(self, data: bytes) -> List[KeyValueEntry]:
+        entries: List[KeyValueEntry] = []
+        pos = 0
+
+        while pos < len(data):
+            if pos + 18 > len(data):
+                raise ValueError(f"truncated KEYS item at payload offset {pos}")
+
+            marker, flags, key_len = struct.unpack_from("<HII", data, pos)
+            if marker != ESIFDV_ITEM_KEYS_REV0_SIGNATURE:
+                raise ValueError(f"invalid KEYS item marker 0x{marker:04x} at payload offset {pos}")
+            if key_len == 0:
+                raise ValueError(f"empty KEYS item key at payload offset {pos}")
+
+            key_start = pos + 10
+            key_end = key_start + key_len
+            if key_end + 8 > len(data):
+                raise ValueError(f"truncated KEYS item key at payload offset {pos}")
+            key = data[key_start:key_end].rstrip(b"\x00").decode("utf-8", errors="replace")
+
+            data_type, data_len = struct.unpack_from("<II", data, key_end)
+            data_start = key_end + 8
+            data_end = data_start + data_len
+            if data_end > len(data):
+                raise ValueError(f"truncated KEYS item value for {key}")
+
+            entries.append(
+                KeyValueEntry(
+                    key=key,
+                    data_type=data_type,
+                    flags=flags,
+                    data=data[data_start:data_end],
+                    marker=marker,
+                )
+            )
+            pos = data_end
+        return entries
+
+    def encode(self) -> bytes:
+        return b"".join(segment.encode() for segment in self.segments)
+
+    def find_entry(self, key: str) -> KeyValueEntry:
+        for entry in self.entries:
+            if entry.key == key:
+                return entry
+        raise KeyError(key)
+
+    def dump_text(self) -> None:
+        if self.segments:
+            for idx, segment in enumerate(self.segments):
+                print(
+                    f"Segment[{idx}]: id={segment.segment_id} version="
+                    f"{segment.major_version}.{segment.minor_version}.{segment.revision} "
+                    f"class={payload_class_name(segment.payload_class)} "
+                    f"payload={segment.payload_size} bytes hash={'ok' if segment.hash_valid else 'BAD'}"
+                )
+            print()
+
+        print(f"Found {len(self.entries)} entries:\n")
+        print("-" * 80)
+        for idx, entry in enumerate(self.entries):
+            print(f"[{idx}] Key: {entry.key}")
+            print(f"    Type: {entry.type_str} ({entry.data_type})")
+            print(f"    Size: {len(entry.data)} bytes")
+
+            value = entry.decoded_value()
+            if isinstance(value, DecodedTable):
+                self._dump_table(value)
+            elif isinstance(value, EsifVariant):
+                print(f"    Variant: {value.type_str} = {value.display()}")
+            elif isinstance(value, list) and all(isinstance(v, EsifVariant) for v in value):
+                print("    Variants:")
+                for vidx, variant in enumerate(value):
+                    print(f"      [{vidx}] {variant.type_str}: {variant.display()}")
+            elif isinstance(value, bytes):
+                if len(value) <= 64:
+                    print(f"    Value: {value.hex()}")
+                else:
+                    print(f"    Value: {value[:64].hex()}... (truncated)")
+            else:
+                text = str(value)
+                if len(text) > 200:
+                    text = text[:200] + "..."
+                print(f"    Value: {text}")
+            print()
+
+    def _dump_table(self, table: DecodedTable) -> None:
+        print(
+            f"    Table: {table.kind.upper()} "
+            f"(revision={table.revision.display()}, rows={len(table.rows)})"
+        )
+        if table.trailing:
+            print(f"      Warning: {len(table.trailing)} trailing variant(s)")
+        for row_idx, row in enumerate(table.rows):
+            prefix = f"Row{row_idx}." if len(table.rows) > 1 else ""
+            for field_idx, variant in enumerate(row):
+                field_name = table.field_names[field_idx]
+                print(f"      {prefix}{field_name}: {variant.display(field_name)}")
+
+    def dump_csv(self) -> None:
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["key", "type", "flags", "size", "value"])
+        for entry in self.entries:
+            writer.writerow(
+                [entry.key, entry.type_str, entry.flags, len(entry.data), value_to_jsonable(entry.decoded_value())]
+            )
+
+    def dump_json(self) -> None:
+        print(json.dumps(self.to_jsonable(), indent=2))
+
+    def to_jsonable(self) -> dict:
+        return {
+            "segments": [
+                {
+                    "segment_id": segment.segment_id,
+                    "comment": segment.comment,
+                    "version": segment.version,
+                    "flags": segment.flags,
+                    "payload_class": payload_class_name(segment.payload_class),
+                    "payload_size": segment.payload_size,
+                    "hash_valid": segment.hash_valid,
+                }
+                for segment in self.segments
+            ],
+            "entries": [
+                {
+                    "key": entry.key,
+                    "type": entry.type_str,
+                    "type_id": entry.data_type,
+                    "flags": entry.flags,
+                    "size": len(entry.data),
+                    "value": value_to_jsonable(entry.decoded_value()),
+                }
+                for entry in self.entries
+            ],
+        }
+
+    def dump(self, output_format: str = "text") -> None:
+        if output_format == "text":
+            self.dump_text()
+        elif output_format == "csv":
+            self.dump_csv()
+        elif output_format == "json":
+            self.dump_json()
+        else:
+            raise ValueError(f"unsupported format: {output_format}")
+
+
+def value_to_jsonable(value: Any) -> Any:
+    if isinstance(value, DecodedTable):
+        return {
+            "kind": value.kind,
+            "revision": value.revision.as_text(),
+            "rows": [
+                {
+                    field_name: variant.display(field_name)
+                    for field_name, variant in zip(value.field_names, row)
+                }
+                for row in value.rows
+            ],
+            "trailing": [variant.display() for variant in value.trailing],
+        }
+    if isinstance(value, EsifVariant):
+        return {"type": value.type_str, "value": value.display()}
+    if isinstance(value, list):
+        return [value_to_jsonable(item) for item in value]
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    return value
+
+
+def parse_file(path: str, verbose: bool = False) -> DataVaultParser:
+    dv = DataVaultParser(verbose=verbose)
+    dv.parse_file(path)
+    return dv
+
+
+def dump_files(paths: Iterable[str], output_format: str, verbose: bool) -> int:
+    status = 0
+    for path in paths:
+        if not os.path.exists(path):
+            print(f"Error: File not found: {path}", file=sys.stderr)
+            status = 1
+            continue
+
+        if output_format == "text":
+            print(f"\n{'=' * 80}")
+            print(f"Parsing: {path}")
+            print(f"{'=' * 80}")
+        try:
+            dv = parse_file(path, verbose=verbose)
+            dv.dump(output_format)
+        except Exception as exc:
+            print(f"Error parsing {path}: {exc}", file=sys.stderr)
+            status = 1
+    return status
 
 
 def main():
