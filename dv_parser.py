@@ -852,6 +852,10 @@ def dkelvin_to_celsius(value: int) -> float:
     return value / 10.0 - 273.15
 
 
+def celsius_to_dkelvin(value: float) -> int:
+    return int(round((value + 273.15) * 10.0))
+
+
 @dataclass
 class EsifVariant:
     type_id: int
@@ -1640,6 +1644,89 @@ def command_build_xml(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_value_arg(value: str) -> int:
+    if value.upper() == "MAX":
+        return MAX_U32
+    return int(value, 0)
+
+
+def require_table(entry: KeyValueEntry, kind: str) -> DecodedTable:
+    table = entry.decode_table()
+    if table is None or table.kind != kind:
+        raise ValueError(f"{entry.key} is not a {kind.upper()} table")
+    return table
+
+
+def require_integer_field(variant: EsifVariant, field_name: str) -> int:
+    if not variant.is_integer:
+        raise ValueError(f"{field_name} is {variant.type_str}, not an integer field")
+    return int(variant.value)
+
+
+def command_set_psvt_temp(args: argparse.Namespace) -> int:
+    dv = parse_file(args.input, verbose=args.verbose)
+    entry = dv.find_entry(args.key)
+    table = require_table(entry, "psvt")
+    if args.row < 0 or args.row >= len(table.rows):
+        raise ValueError(f"row {args.row} is outside PSVT row range 0..{len(table.rows) - 1}")
+
+    field_idx = table.field_index("PassiveTemp(dK)")
+    field_variant = table.rows[args.row][field_idx]
+    old_value = require_integer_field(field_variant, "PassiveTemp(dK)")
+    new_value = args.dkelvin if args.dkelvin is not None else celsius_to_dkelvin(args.celsius)
+
+    table.rows[args.row][field_idx] = field_variant.copy_with_value(new_value)
+    entry.data = table.encode()
+    write_binary(args.output, dv.encode())
+
+    print(
+        f"{args.key}: row {args.row} PassiveTemp(dK) "
+        f"{old_value} ({dkelvin_to_celsius(old_value):.2f} C) -> "
+        f"{new_value} ({dkelvin_to_celsius(new_value):.2f} C)"
+    )
+    return 0
+
+
+def find_ppcc_row(table: DecodedTable, pl_index: int) -> Tuple[int, List[EsifVariant]]:
+    pl_idx_field = table.field_index("PLIndex")
+    for row_idx, row in enumerate(table.rows):
+        if require_integer_field(row[pl_idx_field], "PLIndex") == pl_index:
+            return row_idx, row
+    raise ValueError(f"PPCC PLIndex {pl_index} not found")
+
+
+def command_set_ppcc(args: argparse.Namespace) -> int:
+    updates = [
+        ("MinPower(mW)", args.min_power_mw),
+        ("MaxPower(mW)", args.max_power_mw),
+        ("MinTimeWindow(ms)", args.min_window_ms),
+        ("MaxTimeWindow(ms)", args.max_window_ms),
+        ("StepSize(mW)", args.step_size_mw),
+    ]
+    updates = [(name, value) for name, value in updates if value is not None]
+    if not updates:
+        raise ValueError("set-ppcc requires at least one field update")
+
+    dv = parse_file(args.input, verbose=args.verbose)
+    entry = dv.find_entry(args.key)
+    table = require_table(entry, "ppcc")
+    row_idx, row = find_ppcc_row(table, args.pl_index)
+
+    messages = []
+    for field_name, new_value in updates:
+        field_idx = table.field_index(field_name)
+        old_variant = row[field_idx]
+        old_value = require_integer_field(old_variant, field_name)
+        row[field_idx] = old_variant.copy_with_value(new_value)
+        messages.append(f"{field_name} {old_value} -> {new_value}")
+
+    entry.data = table.encode()
+    write_binary(args.output, dv.encode())
+
+    print(f"{args.key}: PLIndex {args.pl_index} row {row_idx}: " + ", ".join(messages))
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Parse and edit Intel DPTF DataVault (.dv) files",
@@ -1650,6 +1737,7 @@ Examples:
   %(prog)s -f json ../dptf.dv
   %(prog)s dump-xml ../dptf.dv dptf.xml
   %(prog)s build-xml dptf.xml dptf.dv
+  %(prog)s set-psvt-temp ../dptf.dv out.dv --key /shared/tables/psvt/tar70 --celsius 70
 """,
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -1676,6 +1764,30 @@ Examples:
     build_xml.add_argument("output", help="output DataVault file")
     build_xml.set_defaults(func=command_build_xml)
 
+    psvt_temp = subparsers.add_parser("set-psvt-temp", help="set a PSVT PassiveTemp field")
+    psvt_temp.add_argument("input", help="input DataVault file")
+    psvt_temp.add_argument("output", help="output DataVault file")
+    psvt_temp.add_argument("--key", required=True, help="PSVT table key to modify")
+    psvt_temp.add_argument("--row", type=int, default=0, help="PSVT row index (default: 0)")
+    temp_group = psvt_temp.add_mutually_exclusive_group(required=True)
+    temp_group.add_argument("--celsius", type=float, help="new passive temperature in Celsius")
+    temp_group.add_argument("--dkelvin", type=int, help="new passive temperature in decikelvin")
+    psvt_temp.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    psvt_temp.set_defaults(func=command_set_psvt_temp)
+
+    ppcc = subparsers.add_parser("set-ppcc", help="set fields in a PPCC power-limit row")
+    ppcc.add_argument("input", help="input DataVault file")
+    ppcc.add_argument("output", help="output DataVault file")
+    ppcc.add_argument("--key", default="/participants/TCPU.D0/ppcc", help="PPCC table key to modify")
+    ppcc.add_argument("--pl-index", type=int, required=True, help="PPCC PLIndex row selector")
+    ppcc.add_argument("--min-power-mw", type=parse_value_arg, help="new MinPower(mW), integer or MAX")
+    ppcc.add_argument("--max-power-mw", type=parse_value_arg, help="new MaxPower(mW), integer or MAX")
+    ppcc.add_argument("--min-window-ms", type=parse_value_arg, help="new MinTimeWindow(ms), integer or MAX")
+    ppcc.add_argument("--max-window-ms", type=parse_value_arg, help="new MaxTimeWindow(ms), integer or MAX")
+    ppcc.add_argument("--step-size-mw", type=parse_value_arg, help="new StepSize(mW), integer or MAX")
+    ppcc.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    ppcc.set_defaults(func=command_set_ppcc)
+
     return parser
 
 
@@ -1684,7 +1796,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         argv = sys.argv[1:]
 
     # Preserve the original command line shape: dv_parser.py [-f json] file.dv
-    if argv and argv[0] not in ("dump", "dump-xml", "build-xml", "-h", "--help"):
+    commands = ("dump", "dump-xml", "build-xml", "set-psvt-temp", "set-ppcc")
+    if argv and argv[0] not in commands + ("-h", "--help"):
         legacy = argparse.ArgumentParser(description="Parse Intel DPTF DataVault (.dv) files")
         legacy.add_argument("files", nargs="+", help="DataVault file(s) to parse")
         legacy.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
