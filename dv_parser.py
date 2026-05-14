@@ -13,10 +13,12 @@ import struct
 import sys
 import os
 import zlib
+import argparse
 import base64
 import csv
 import hashlib
 import json
+import xml.etree.ElementTree as ET
 from enum import IntEnum
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Sequence, Tuple, BinaryIO
@@ -1326,6 +1328,9 @@ class DataVaultParser:
             self.dump_csv()
         elif output_format == "json":
             self.dump_json()
+        elif output_format == "xml":
+            sys.stdout.buffer.write(xml_to_bytes(parser_to_xml(self)))
+            sys.stdout.buffer.write(b"\n")
         else:
             raise ValueError(f"unsupported format: {output_format}")
 
@@ -1380,41 +1385,328 @@ def dump_files(paths: Iterable[str], output_format: str, verbose: bool) -> int:
     return status
 
 
-def main():
-    import argparse
-    
+def int_attr(element: ET.Element, name: str, default: Optional[int] = None) -> int:
+    value = element.get(name)
+    if value is None:
+        if default is None:
+            raise ValueError(f"missing XML attribute {name}")
+        return default
+    return int(value, 0)
+
+
+def bool_text(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def variant_to_xml(parent: ET.Element, tag: str, variant: EsifVariant, index: int,
+                   field_name: Optional[str] = None) -> ET.Element:
+    attrs = {
+        "index": str(index),
+        "type": variant.type_str,
+        "type_id": str(variant.type_id),
+    }
+    if field_name:
+        attrs["name"] = field_name
+
+    if variant.is_integer:
+        attrs["value"] = str(variant.value)
+        display = variant.display(field_name)
+        if display != str(variant.value):
+            attrs["display"] = display
+        if field_name and "Temp" in field_name and variant.value not in (MAX_U32, MAX_U64):
+            attrs["celsius"] = f"{dkelvin_to_celsius(variant.value):.2f}"
+    elif variant.type_id in (EsifDataType.STRING, EsifDataType.UNICODE):
+        attrs["value"] = variant.as_text()
+        attrs["reserved"] = str(variant.reserved)
+    elif variant.type_id == EsifDataType.GUID:
+        attrs["value"] = variant.as_text()
+        attrs["reserved"] = str(variant.reserved)
+    else:
+        attrs["encoding"] = "base64"
+        attrs["reserved"] = str(variant.reserved)
+
+    element = ET.SubElement(parent, tag, attrs)
+    if attrs.get("encoding") == "base64":
+        element.text = base64.b64encode(variant.value).decode("ascii")
+    return element
+
+
+def table_to_xml(parent: ET.Element, table: DecodedTable) -> ET.Element:
+    table_el = ET.SubElement(
+        parent,
+        "table",
+        {
+            "kind": table.kind,
+            "revision": table.revision.as_text(),
+            "revision_type": table.revision.type_str,
+            "revision_type_id": str(table.revision.type_id),
+            "rows": str(len(table.rows)),
+        },
+    )
+    for row_idx, row in enumerate(table.rows):
+        row_el = ET.SubElement(table_el, "row", {"index": str(row_idx)})
+        for field_idx, variant in enumerate(row):
+            variant_to_xml(row_el, "field", variant, field_idx, table.field_names[field_idx])
+    if table.trailing:
+        trailing_el = ET.SubElement(table_el, "trailing")
+        for idx, variant in enumerate(table.trailing):
+            variant_to_xml(trailing_el, "variant", variant, idx)
+    return table_el
+
+
+def parser_to_xml(dv: DataVaultParser) -> ET.ElementTree:
+    root = ET.Element("datavault", {"format": "intel-dptf-dv", "version": "1"})
+    for segment_idx, segment in enumerate(dv.segments):
+        segment_el = ET.SubElement(
+            root,
+            "segment",
+            {
+                "index": str(segment_idx),
+                "signature": f"0x{segment.signature:04x}",
+                "header_size": str(segment.header_size),
+                "version": f"0x{segment.version:08x}",
+                "flags": f"0x{segment.flags:08x}",
+                "segment_id": segment.segment_id,
+                "comment": segment.comment,
+                "payload_class": payload_class_name(segment.payload_class),
+                "payload_class_id": f"0x{segment.payload_class:08x}",
+                "payload_size": str(segment.payload_size),
+                "hash_valid": bool_text(segment.hash_valid),
+            },
+        )
+        for entry_idx, entry in enumerate(segment.entries):
+            entry_el = ET.SubElement(
+                segment_el,
+                "entry",
+                {
+                    "index": str(entry_idx),
+                    "key": entry.key,
+                    "type": entry.type_str,
+                    "type_id": str(entry.data_type),
+                    "flags": str(entry.flags),
+                    "size": str(len(entry.data)),
+                },
+            )
+            raw_el = ET.SubElement(entry_el, "raw", {"encoding": "base64"})
+            raw_el.text = base64.b64encode(entry.data).decode("ascii")
+
+            table = entry.decode_table()
+            if table is not None:
+                table_to_xml(entry_el, table)
+                continue
+
+            variants = entry.decode_variants()
+            if variants:
+                variants_el = ET.SubElement(entry_el, "variants")
+                for variant_idx, variant in enumerate(variants):
+                    variant_to_xml(variants_el, "variant", variant, variant_idx)
+    return ET.ElementTree(root)
+
+
+def xml_to_bytes(tree: ET.ElementTree) -> bytes:
+    if hasattr(ET, "indent"):
+        ET.indent(tree, space="  ")
+    return ET.tostring(tree.getroot(), encoding="utf-8", xml_declaration=True)
+
+
+def parse_guid_text(value: str) -> bytes:
+    parts = value.split("-")
+    if len(parts) != 5:
+        raise ValueError(f"invalid GUID {value}")
+    raw_hex = "".join(parts)
+    if len(raw_hex) != 32:
+        raise ValueError(f"invalid GUID {value}")
+    d = bytes.fromhex(raw_hex)
+    return bytes([d[3], d[2], d[1], d[0], d[5], d[4], d[7], d[6]]) + d[8:]
+
+
+def variant_from_xml(element: ET.Element) -> EsifVariant:
+    type_id = int_attr(element, "type_id")
+    reserved = int_attr(element, "reserved", 0)
+    try:
+        data_type = EsifDataType(type_id)
+    except ValueError as exc:
+        raise ValueError(f"unknown XML variant type_id {type_id}") from exc
+
+    if data_type in INTEGER_VARIANT_TYPES:
+        return EsifVariant(type_id, int_attr(element, "value"), reserved=reserved)
+
+    if data_type == EsifDataType.STRING:
+        value = element.get("value", "").encode("utf-8") + b"\x00"
+        return EsifVariant(type_id, value, reserved=reserved)
+    if data_type == EsifDataType.UNICODE:
+        value = element.get("value", "").encode("utf-16-le") + b"\x00\x00"
+        return EsifVariant(type_id, value, reserved=reserved)
+    if data_type == EsifDataType.GUID:
+        return EsifVariant(type_id, parse_guid_text(element.get("value", "")), reserved=reserved)
+
+    text = element.text or ""
+    return EsifVariant(type_id, base64.b64decode(text.encode("ascii")), reserved=reserved)
+
+
+def table_from_xml(element: ET.Element) -> DecodedTable:
+    kind = element.get("kind", "")
+    if kind == "psvt":
+        field_names = PSVT_FIELDS
+    elif kind == "ppcc":
+        field_names = PPCC_FIELDS_PER_ROW
+    else:
+        raise ValueError(f"unknown table kind {kind}")
+
+    revision = EsifVariant(int_attr(element, "revision_type_id", EsifDataType.UINT64),
+                           int_attr(element, "revision"))
+    rows: List[List[EsifVariant]] = []
+    for row_el in element.findall("row"):
+        fields = [variant_from_xml(field_el) for field_el in row_el.findall("field")]
+        if len(fields) != len(field_names):
+            raise ValueError(f"{kind} row has {len(fields)} field(s), expected {len(field_names)}")
+        rows.append(fields)
+
+    trailing: List[EsifVariant] = []
+    trailing_el = element.find("trailing")
+    if trailing_el is not None:
+        trailing = [variant_from_xml(variant_el) for variant_el in trailing_el.findall("variant")]
+    return DecodedTable(kind, revision, rows, list(field_names), trailing)
+
+
+def entry_data_from_xml(element: ET.Element) -> bytes:
+    table_el = element.find("table")
+    if table_el is not None:
+        return table_from_xml(table_el).encode()
+
+    raw_el = element.find("raw")
+    if raw_el is None or raw_el.text is None:
+        raise ValueError(f"entry {element.get('key')} has neither table nor raw data")
+    return base64.b64decode(raw_el.text.encode("ascii"))
+
+
+def parser_from_xml(path: str) -> DataVaultParser:
+    tree = ET.parse(path)
+    root = tree.getroot()
+    if root.tag != "datavault":
+        raise ValueError("XML root must be <datavault>")
+
+    dv = DataVaultParser()
+    for segment_el in root.findall("segment"):
+        entries: List[KeyValueEntry] = []
+        for entry_el in segment_el.findall("entry"):
+            entries.append(
+                KeyValueEntry(
+                    key=entry_el.get("key", ""),
+                    data_type=int_attr(entry_el, "type_id"),
+                    flags=int_attr(entry_el, "flags", 0),
+                    data=entry_data_from_xml(entry_el),
+                )
+            )
+        raw_payload = b"".join(entry.encode() for entry in entries)
+        payload_hash = hashlib.sha256(raw_payload).digest()
+        segment = DataVaultSegment(
+            signature=int_attr(segment_el, "signature", ESIFDV_SIGNATURE),
+            header_size=int_attr(segment_el, "header_size", ESIFDV_HEADER_V2_MIN_SIZE),
+            version=int_attr(segment_el, "version"),
+            flags=int_attr(segment_el, "flags", 0),
+            segment_id=segment_el.get("segment_id", ""),
+            comment=segment_el.get("comment", ""),
+            payload_hash=payload_hash,
+            payload_size=len(raw_payload),
+            payload_class=int_attr(segment_el, "payload_class_id", PayloadClass.KEYS),
+            entries=entries,
+            raw_payload=raw_payload,
+        )
+        dv.segments.append(segment)
+        dv.entries.extend(entries)
+    return dv
+
+
+def write_binary(path: str, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def command_dump_xml(args: argparse.Namespace) -> int:
+    dv = parse_file(args.input, verbose=args.verbose)
+    data = xml_to_bytes(parser_to_xml(dv))
+    if args.output == "-":
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.write(b"\n")
+    else:
+        write_binary(args.output, data)
+    return 0
+
+
+def command_build_xml(args: argparse.Namespace) -> int:
+    dv = parser_from_xml(args.input)
+    write_binary(args.output, dv.encode())
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Parse Intel DPTF DataVault (.dv) files',
+        description="Parse and edit Intel DPTF DataVault (.dv) files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s DPTF.dv
-  %(prog)s -v -f json dsp.dv
-  %(prog)s -f csv *.dv > output.csv
-"""
+  %(prog)s ../dptf.dv
+  %(prog)s -f json ../dptf.dv
+  %(prog)s dump-xml ../dptf.dv dptf.xml
+  %(prog)s build-xml dptf.xml dptf.dv
+""",
     )
-    parser.add_argument('files', nargs='+', help='DataVault file(s) to parse')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('-f', '--format', choices=['text', 'csv', 'json'], 
-                        default='text', help='Output format (default: text)')
-    
-    args = parser.parse_args()
-    
-    for filepath in args.files:
-        if not os.path.exists(filepath):
-            print(f"Error: File not found: {filepath}")
-            continue
-            
-        print(f"\n{'='*80}")
-        print(f"Parsing: {filepath}")
-        print(f"{'='*80}")
-        
-        dv_parser = DataVaultParser(verbose=args.verbose)
-        if dv_parser.parse_file(filepath):
-            dv_parser.dump(args.format)
-        else:
-            print(f"Failed to parse {filepath}")
+    subparsers = parser.add_subparsers(dest="command")
+
+    dump = subparsers.add_parser("dump", help="dump one or more DV files")
+    dump.add_argument("files", nargs="+", help="DataVault file(s) to parse")
+    dump.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    dump.add_argument(
+        "-f",
+        "--format",
+        choices=["text", "csv", "json", "xml"],
+        default="text",
+        help="Output format (default: text)",
+    )
+
+    dump_xml = subparsers.add_parser("dump-xml", help="dump a DV file as editable XML")
+    dump_xml.add_argument("input", help="input DataVault file")
+    dump_xml.add_argument("output", nargs="?", default="-", help="output XML file, or '-' for stdout")
+    dump_xml.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    dump_xml.set_defaults(func=command_dump_xml)
+
+    build_xml = subparsers.add_parser("build-xml", help="build a DV file from XML")
+    build_xml.add_argument("input", help="input XML file")
+    build_xml.add_argument("output", help="output DataVault file")
+    build_xml.set_defaults(func=command_build_xml)
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Preserve the original command line shape: dv_parser.py [-f json] file.dv
+    if argv and argv[0] not in ("dump", "dump-xml", "build-xml", "-h", "--help"):
+        legacy = argparse.ArgumentParser(description="Parse Intel DPTF DataVault (.dv) files")
+        legacy.add_argument("files", nargs="+", help="DataVault file(s) to parse")
+        legacy.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+        legacy.add_argument(
+            "-f",
+            "--format",
+            choices=["text", "csv", "json", "xml"],
+            default="text",
+            help="Output format (default: text)",
+        )
+        args = legacy.parse_args(argv)
+        return dump_files(args.files, args.format, args.verbose)
+
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.command == "dump":
+        return dump_files(args.files, args.format, args.verbose)
+    if hasattr(args, "func"):
+        return args.func(args)
+    parser.print_help()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
